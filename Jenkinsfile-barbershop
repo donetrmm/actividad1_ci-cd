@@ -221,7 +221,7 @@ pipeline {
                                     echo "Usando ts-node con src/main.ts como punto de entrada"
                                 elif [ ! -f "$ENTRY_POINT" ]; then
                                     # Buscar cualquier archivo JavaScript en la carpeta dist
-                                    POTENTIAL_ENTRY=$(find dist -name "*.js" 2>/dev/null | head -n 1 || echo "")
+                                    POTENTIAL_ENTRY=\\$(find dist -name "*.js" 2>/dev/null | head -n 1 || echo "")
                                     if [ -n "$POTENTIAL_ENTRY" ]; then
                                         ENTRY_POINT="$POTENTIAL_ENTRY"
                                         echo "Usando $POTENTIAL_ENTRY como punto de entrada"
