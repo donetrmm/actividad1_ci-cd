@@ -12,19 +12,35 @@ pipeline {
         SERVER_PROD = '54.221.226.38' // IP del servidor 3
         DEPLOY_USER = 'ubuntu'    // Usuario para SSH
         APP_DIR = '/home/ubuntu/barbershop-service' // Directorio de la aplicación en el servidor
-        REPOSITORY = 'https://github.com/donetrmm/barbershop-service.git' // Repositorio Git
+        CODE_REPOSITORY = 'https://github.com/donetrmm/barbershop-service.git' // Repositorio de código a desplegar
+        NODE_ENV = 'production'   // Entorno de Node.js
+        APP_NAME = 'barbershop-service'   // Nombre de la aplicación para PM2
     }
     
     stages {
-        stage('Checkout') {
+        stage('Checkout Jenkinsfile') {
             steps {
+                // Este es el checkout del repositorio que contiene el Jenkinsfile
                 checkout scm
+                echo "Verificando repositorio del Jenkinsfile..."
+                sh 'ls -la'
             }
         }
         
-        stage('Install Dependencies') {
+        stage('Check Environment') {
             steps {
-                sh 'npm ci'
+                // Verificar el entorno de Jenkins
+                sh '''
+                    echo "Verificando el entorno de Jenkins:"
+                    echo "WORKSPACE: $WORKSPACE"
+                    echo "BRANCH_NAME: $BRANCH_NAME"
+                    echo "NODE_NAME: $NODE_NAME"
+                    echo "JOB_NAME: $JOB_NAME"
+                    
+                    echo "Versiones instaladas:"
+                    node --version || echo "Node.js no disponible"
+                    npm --version || echo "NPM no disponible"
+                '''
             }
         }
              
@@ -32,7 +48,7 @@ pipeline {
             steps {
                 script {
                     def targetServer = ''
-                    def targetBranch = env.BRANCH_NAME
+                    def targetBranch = env.BRANCH_NAME ?: 'main'  // Default a main si BRANCH_NAME no está definido
                     
                     // Determinar el servidor según la rama
                     if (targetBranch == 'dev') {
@@ -42,15 +58,20 @@ pipeline {
                     } else if (targetBranch == 'main') {
                         targetServer = env.SERVER_PROD
                     } else {
-                        echo "No se desplegará la rama: ${targetBranch}"
+                        echo "No se desplegará desde la rama: ${targetBranch}"
                         return
                     }
+                    
+                    echo "Desplegando desde la rama '${targetBranch}' al servidor '${targetServer}'..."
                     
                     // Desplegar en el servidor correspondiente
                     withCredentials([sshUserPrivateKey(credentialsId: 'server-ssh-key', keyFileVariable: 'SSH_KEY')]) {
                         sh """
                             ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no ${DEPLOY_USER}@${targetServer} '
+                                echo "Iniciando despliegue en ${targetServer}..."
+                                
                                 # Actualizar repositorios
+                                echo "Actualizando repositorios del sistema..."
                                 sudo apt update && sudo apt upgrade -y
 
                                 # Instalación de NVM y Node
@@ -77,6 +98,12 @@ pipeline {
                                 echo "Versión de NPM:"
                                 npm --version
                                 
+                                # Instalar TypeScript globalmente
+                                echo "Instalando TypeScript globalmente..."
+                                npm install -g typescript
+                                echo "Versión de TypeScript:"
+                                tsc --version
+                                
                                 # Instalar PM2 globalmente
                                 echo "Instalando PM2..."
                                 npm install -g pm2
@@ -88,19 +115,50 @@ pipeline {
                                     sudo apt install -y git
                                 fi
 
-                                # Clonar o actualizar repositorio
+                                # Clonar o actualizar repositorio de CÓDIGO (no el del Jenkinsfile)
                                 if [ ! -d ${APP_DIR} ]; then
-                                    echo "Clonando repositorio..."
+                                    echo "Clonando repositorio de código..."
                                     mkdir -p ${APP_DIR}
                                     cd ${APP_DIR}
-                                    git clone ${REPOSITORY} .
-                                    git checkout ${targetBranch}
+                                    git clone ${CODE_REPOSITORY} .
+                                    git checkout ${targetBranch} || git checkout main
                                 else
-                                    echo "Actualizando repositorio..."
+                                    echo "Actualizando repositorio de código..."
                                     cd ${APP_DIR}
                                     git fetch --all
-                                    git checkout ${targetBranch}
-                                    git pull origin ${targetBranch}
+                                    git checkout ${targetBranch} || git checkout main
+                                    git pull origin ${targetBranch} || git pull origin main
+                                fi
+                                
+                                # Verificar la estructura del proyecto
+                                echo "Verificando estructura del proyecto NestJS..."
+                                ls -la
+                                
+                                if [ -f "package.json" ]; then
+                                    echo "Archivo package.json encontrado"
+                                    grep -E \\"name|version|scripts.start|scripts.build\\" package.json || echo "No se pudo verificar los scripts"
+                                else
+                                    echo "ERROR: No se encontró package.json en el repositorio"
+                                    exit 1
+                                fi
+                                
+                                if [ -f "tsconfig.json" ]; then
+                                    echo "Archivo tsconfig.json encontrado - Proyecto TypeScript confirmado"
+                                else
+                                    echo "ADVERTENCIA: No se encontró tsconfig.json"
+                                fi
+                                
+                                if [ -f "nest-cli.json" ]; then
+                                    echo "Archivo nest-cli.json encontrado - Proyecto NestJS confirmado"
+                                else
+                                    echo "ADVERTENCIA: No se encontró nest-cli.json"
+                                fi
+                                
+                                if [ -d "src" ]; then
+                                    echo "Verificando estructura de carpeta src:"
+                                    ls -la src/
+                                else
+                                    echo "ADVERTENCIA: No se encontró la carpeta src"
                                 fi
                                 
                                 # Asegurar que NVM está cargado para cada comando
@@ -108,30 +166,147 @@ pipeline {
                                 [ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
                                 nvm use --lts
                                 
-                                echo "Instalando dependencias..."
-                                npm ci
-                                
-                                # Revisar si existe script build antes de ejecutarlo
-                                if grep -q "\\\"build\\\"" package.json; then
-                                    echo "Ejecutando build..."
-                                    npm run build
+                                # Verificar si existe package-lock.json y usar npm ci o npm install según corresponda
+                                if [ -f "package-lock.json" ]; then
+                                    echo "Usando npm ci para instalación reproducible con package-lock.json"
+                                    npm ci
                                 else
-                                    echo "No hay script de build en package.json, omitiendo este paso"
+                                    echo "No se encontró package-lock.json, usando npm install"
+                                    npm install
+                                fi
+                                
+                                # Compilar TypeScript con NestJS solo si existe script build
+                                if grep -q "\\\"build\\\"" package.json; then
+                                    echo "Compilando proyecto NestJS..."
+                                    npm run build
+                                    
+                                    # Verificar si la compilación fue exitosa
+                                    if [ -d "dist" ]; then
+                                        echo "Compilación exitosa, contenido de la carpeta dist:"
+                                        ls -la dist/
+                                    else
+                                        echo "ADVERTENCIA: No se creó la carpeta dist después de la compilación"
+                                    fi
+                                else
+                                    echo "No hay script de build en package.json, intentando compilar TypeScript directamente"
+                                    # Si hay tsconfig.json, intentar compilar con tsc
+                                    if [ -f "tsconfig.json" ]; then
+                                        npx tsc
+                                    else
+                                        echo "No se encontró tsconfig.json, omitiendo la compilación"
+                                    fi
+                                fi
+                                
+                                # Crear o actualizar archivo .env si es necesario
+                                if [ ! -f .env ]; then
+                                    echo "Creando archivo .env para ${targetBranch}..."
+                                    if [ -f .env.example ]; then
+                                        cp .env.example .env
+                                    else
+                                        echo "NODE_ENV=${targetBranch}" > .env
+                                    fi
+                                fi
+                                
+                                # Determinar el punto de entrada correcto
+                                ENTRY_POINT="dist/main.js"
+                                if [ ! -f "$ENTRY_POINT" ] && [ -f "dist/index.js" ]; then
+                                    ENTRY_POINT="dist/index.js"
+                                    echo "Usando dist/index.js como punto de entrada"
+                                elif [ ! -f "$ENTRY_POINT" ] && [ -f "src/main.ts" ]; then
+                                    # Si no hay archivos compilados pero existe main.ts, usamos ts-node
+                                    echo "Instalando ts-node para ejecutar TypeScript directamente..."
+                                    npm install -g ts-node
+                                    ENTRY_POINT="src/main.ts"
+                                    TS_NODE="true"
+                                    echo "Usando ts-node con src/main.ts como punto de entrada"
+                                elif [ ! -f "$ENTRY_POINT" ]; then
+                                    # Buscar cualquier archivo JavaScript en la carpeta dist
+                                    POTENTIAL_ENTRY=$(find dist -name "*.js" 2>/dev/null | head -n 1 || echo "")
+                                    if [ -n "$POTENTIAL_ENTRY" ]; then
+                                        ENTRY_POINT="$POTENTIAL_ENTRY"
+                                        echo "Usando $POTENTIAL_ENTRY como punto de entrada"
+                                    fi
+                                fi
+                                
+                                # Verificar si hay script start en package.json y configurar PM2 adecuadamente
+                                if grep -q "\\\"start\\\"" package.json; then
+                                    USE_NPM_START="true"
+                                    echo "Se usará npm start para iniciar la aplicación"
+                                else
+                                    echo "No se encontró script start, se usará directamente: $ENTRY_POINT"
+                                fi
+                                
+                                # Crear ecosystem.config.js para PM2
+                                echo "Creando configuración de PM2..."
+                                if [ "$USE_NPM_START" = "true" ]; then
+                                    # Configuración con npm start
+                                    cat > ecosystem.config.js << EOF
+const appName = "${APP_NAME}";
+
+module.exports = {
+  apps: [
+    {
+      name: appName,
+      script: "npm",
+      args: "start",
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "1G",
+      env: {
+        NODE_ENV: "${targetBranch}"
+      }
+    }
+  ]
+};
+EOF
+                                else
+                                    # Configuración directa con el punto de entrada
+                                    cat > ecosystem.config.js << EOF
+const appName = "${APP_NAME}";
+
+module.exports = {
+  apps: [
+    {
+      name: appName,
+      script: "${ENTRY_POINT}",
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "1G",
+      ${TS_NODE:+"interpreter: \\"ts-node\\","}
+      env: {
+        NODE_ENV: "${targetBranch}"
+      }
+    }
+  ]
+};
+EOF
                                 fi
                                 
                                 # Reiniciar con PM2
                                 echo "Configurando PM2..."
-                                if pm2 list | grep -q "node-healthcheck"; then
+                                if pm2 list | grep -q "${APP_NAME}"; then
                                     echo "Reiniciando aplicación con PM2..."
-                                    pm2 restart node-healthcheck
+                                    pm2 reload ecosystem.config.js || pm2 restart ${APP_NAME}
                                 else
                                     echo "Iniciando aplicación con PM2 por primera vez..."
-                                    pm2 start npm --name "node-healthcheck" -- start
+                                    pm2 start ecosystem.config.js
                                 fi
+                                
+                                # Verificar estado de PM2
+                                echo "Estado actual de PM2:"
+                                pm2 status
                                 
                                 # Guardar configuración de PM2
                                 echo "Guardando configuración de PM2..."
                                 pm2 save
+                                
+                                # Configurar PM2 para iniciar en el arranque
+                                echo "Configurando PM2 para iniciar en el arranque..."
+                                pm2 startup | tail -n 1 | bash || echo "ADVERTENCIA: No se pudo configurar PM2 startup automáticamente"
+                                
+                                echo "Despliegue completado con éxito en ${targetServer}"
                             '
                         """
                     }
@@ -142,10 +317,10 @@ pipeline {
     
     post {
         success {
-            echo "Pipeline ejecutado con éxito!"
+            echo "¡Pipeline ejecutado con éxito! La aplicación NestJS ha sido desplegada correctamente."
         }
         failure {
-            echo "El pipeline ha fallado."
+            echo "El pipeline ha fallado durante el despliegue de la aplicación NestJS."
         }
     }
 }
